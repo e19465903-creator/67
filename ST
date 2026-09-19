@@ -1,0 +1,390 @@
+--[[
+	EggInspector (LocalScript ฉบับเต็ม ไม่บีบอัด)
+	วางที่: StarterPlayer > StarterPlayerScripts  (ต้องเป็น LocalScript)
+
+	- ปุ่มเมนู 🥚 ที่ด้านซ้ายของจอ กดเพื่อเปิด/ปิดหน้าต่าง (หรือกด F2)
+	- แสดงของในไข่ทุกใบ จัดอันดับ กดที่ไข่เพื่อขยายดูของข้างใน
+	- ปุ่ม "วาร์ป" ไปหน้าไข่แต่ละใบ และ "วาร์ปไปไข่ที่ดีที่สุด"
+	- ใช้ได้เฉพาะ UserId ใน DevUserIds (ใน Studio ใช้ได้เสมอ)
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+
+------------------------------------------------------------------
+-- CONFIG (แก้ตรงนี้)
+------------------------------------------------------------------
+local CONFIG = {
+	-- โฟลเดอร์ใน Workspace ที่เก็บโมเดลไข่ (ชื่อโมเดล = ชื่อ key ใน EGG_DATA)
+	EggFolderName = "Eggs",
+
+	-- UserId ของ dev ที่ใช้เครื่องมือนี้ได้
+	DevUserIds = { 1234567 },
+	AllowInStudio = true,
+
+	-- เกณฑ์จัดอันดับ: "EVPerCost" | "EV" | "RareChance"
+	--   EVPerCost  = มูลค่าคาดหวังต่อราคา (คุ้มสุด)
+	--   EV         = มูลค่าคาดหวังรวม
+	--   RareChance = โอกาสรวมของของหายาก
+	RankBy = "EVPerCost",
+
+	-- ของที่มีโอกาส <= ค่านี้ (%) ถือว่า "หายาก"
+	RareThreshold = 5,
+
+	-- ระยะยืนหน้าไข่หลังวาร์ป (พิกัดโลคัลของไข่)
+	TeleportOffset = Vector3.new(0, 3, 8),
+
+	ToggleKey = Enum.KeyCode.F2,
+}
+
+-- ข้อมูลไข่: แก้เป็นของเกมคุณ
+-- Chance = เปอร์เซ็นต์ (รวมกันควรได้ 100), Value = มูลค่าของสิ่งที่ได้
+local EGG_DATA = {
+	["Basic Egg"] = {
+		Price = 100,
+		Pets = {
+			{ Name = "Dog", Chance = 60, Value = 10 },
+			{ Name = "Cat", Chance = 30, Value = 25 },
+			{ Name = "Bunny", Chance = 9, Value = 120 },
+			{ Name = "Dragon", Chance = 1, Value = 2500 },
+		},
+	},
+	["Forest Egg"] = {
+		Price = 500,
+		Pets = {
+			{ Name = "Deer", Chance = 55, Value = 40 },
+			{ Name = "Fox", Chance = 35, Value = 150 },
+			{ Name = "Owl", Chance = 8, Value = 900 },
+			{ Name = "Ent", Chance = 2, Value = 8000 },
+		},
+	},
+	["Golden Egg"] = {
+		Price = 5000,
+		Pets = {
+			{ Name = "Golden Dog", Chance = 70, Value = 300 },
+			{ Name = "Golden Cat", Chance = 25, Value = 1200 },
+			{ Name = "Phoenix", Chance = 4.5, Value = 15000 },
+			{ Name = "Celestial Dragon", Chance = 0.5, Value = 200000 },
+		},
+	},
+}
+
+------------------------------------------------------------------
+-- ตรวจสิทธิ์ (คนที่ไม่ใช่ dev สคริปต์จะหยุดทำงานทันที)
+------------------------------------------------------------------
+local isDev = table.find(CONFIG.DevUserIds, player.UserId) ~= nil
+if not (isDev or (CONFIG.AllowInStudio and RunService:IsStudio())) then
+	return
+end
+
+------------------------------------------------------------------
+-- วิเคราะห์ไข่
+------------------------------------------------------------------
+local function analyze(eggName, data)
+	local ev, rare, total = 0, 0, 0
+	for _, pet in ipairs(data.Pets) do
+		total += pet.Chance
+		ev += (pet.Chance / 100) * pet.Value
+		if pet.Chance <= CONFIG.RareThreshold then
+			rare += pet.Chance
+		end
+	end
+
+	local price = math.max(data.Price or 0, 1)
+	local score
+	if CONFIG.RankBy == "EV" then
+		score = ev
+	elseif CONFIG.RankBy == "RareChance" then
+		score = rare
+	else
+		score = ev / price
+	end
+
+	-- เรียงของในไข่จากโอกาสมากไปน้อย
+	local pets = table.clone(data.Pets)
+	table.sort(pets, function(a, b)
+		return a.Chance > b.Chance
+	end)
+
+	return {
+		Name = eggName,
+		Price = data.Price or 0,
+		EV = ev,
+		RareChance = rare,
+		Total = total,
+		Score = score,
+		Pets = pets,
+	}
+end
+
+local function buildRanking()
+	local list = {}
+	for eggName, data in pairs(EGG_DATA) do
+		table.insert(list, analyze(eggName, data))
+	end
+	table.sort(list, function(a, b)
+		return a.Score > b.Score
+	end)
+	return list
+end
+
+------------------------------------------------------------------
+-- วาร์ป
+------------------------------------------------------------------
+local function teleportToEgg(eggName)
+	local folder = workspace:FindFirstChild(CONFIG.EggFolderName)
+	local egg = folder and folder:FindFirstChild(eggName)
+	local char = player.Character
+
+	if not egg then
+		warn("[EggInspector] ไม่พบไข่ใน Workspace." .. CONFIG.EggFolderName .. ": " .. eggName)
+		return
+	end
+	if not char then
+		return
+	end
+
+	-- GetPivot ใช้ได้ทั้ง Model และ BasePart
+	char:PivotTo(egg:GetPivot() * CFrame.new(CONFIG.TeleportOffset))
+end
+
+------------------------------------------------------------------
+-- UI helpers
+------------------------------------------------------------------
+local function make(className, props, parent)
+	local inst = Instance.new(className)
+	for key, value in pairs(props) do
+		inst[key] = value
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function rarityColor(chance)
+	if chance <= 1 then
+		return Color3.fromRGB(255, 200, 60) -- ทอง
+	elseif chance <= 5 then
+		return Color3.fromRGB(190, 120, 255) -- ม่วง
+	elseif chance <= 20 then
+		return Color3.fromRGB(90, 160, 255) -- ฟ้า
+	end
+	return Color3.fromRGB(190, 190, 190) -- เทา
+end
+
+local function fmt(n)
+	if n >= 1e6 then
+		return string.format("%.1fM", n / 1e6)
+	elseif n >= 1e3 then
+		return string.format("%.1fK", n / 1e3)
+	end
+	return string.format("%.1f", n)
+end
+
+------------------------------------------------------------------
+-- สร้าง UI
+------------------------------------------------------------------
+local gui = make("ScreenGui", {
+	Name = "EggInspector",
+	ResetOnSpawn = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, player:WaitForChild("PlayerGui"))
+
+-- หน้าต่างหลัก (เริ่มต้นซ่อนไว้ จะขึ้นเมื่อกดปุ่มเมนู)
+local main = make("Frame", {
+	Size = UDim2.fromOffset(380, 440),
+	Position = UDim2.new(0, 64, 0.5, -220),
+	BackgroundColor3 = Color3.fromRGB(28, 28, 34),
+	BorderSizePixel = 0,
+	Active = true,
+	Draggable = true,
+	Visible = false,
+}, gui)
+make("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
+
+-- ปุ่มเมนู 🥚
+local menuBtn = make("TextButton", {
+	Size = UDim2.fromOffset(44, 44),
+	Position = UDim2.new(0, 10, 0.5, -22),
+	BackgroundColor3 = Color3.fromRGB(28, 28, 34),
+	Text = "🥚",
+	TextSize = 24,
+	TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBold,
+}, gui)
+make("UICorner", { CornerRadius = UDim.new(1, 0) }, menuBtn)
+
+make("TextLabel", {
+	Size = UDim2.new(1, -12, 0, 26),
+	Position = UDim2.fromOffset(10, 4),
+	BackgroundTransparency = 1,
+	Text = "🥚 Egg Inspector (F2)",
+	TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBold,
+	TextSize = 15,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local bestBtn = make("TextButton", {
+	Size = UDim2.new(0.68, -10, 0, 32),
+	Position = UDim2.fromOffset(8, 34),
+	BackgroundColor3 = Color3.fromRGB(70, 160, 90),
+	Text = "⚡ วาร์ปไปไข่ที่ดีที่สุด",
+	TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBold,
+	TextSize = 14,
+}, main)
+make("UICorner", { CornerRadius = UDim.new(0, 8) }, bestBtn)
+
+local refreshBtn = make("TextButton", {
+	Size = UDim2.new(0.32, -8, 0, 32),
+	Position = UDim2.new(0.68, 2, 0, 34),
+	BackgroundColor3 = Color3.fromRGB(60, 60, 72),
+	Text = "🔄 รีเฟรช",
+	TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.Gotham,
+	TextSize = 14,
+}, main)
+make("UICorner", { CornerRadius = UDim.new(0, 8) }, refreshBtn)
+
+local scroll = make("ScrollingFrame", {
+	Size = UDim2.new(1, -16, 1, -78),
+	Position = UDim2.fromOffset(8, 72),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 5,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, main)
+make("UIListLayout", {
+	Padding = UDim.new(0, 5),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+}, scroll)
+
+------------------------------------------------------------------
+-- แถวไข่แต่ละใบ
+------------------------------------------------------------------
+local function buildRow(rank, info)
+	local row = make("Frame", {
+		Size = UDim2.new(1, -6, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = Color3.fromRGB(42, 42, 52),
+		BorderSizePixel = 0,
+		LayoutOrder = rank,
+	}, scroll)
+	make("UICorner", { CornerRadius = UDim.new(0, 8) }, row)
+	make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, row)
+
+	-- ไข่ที่ดีที่สุดมีกรอบทอง
+	if rank == 1 then
+		make("UIStroke", { Color = Color3.fromRGB(255, 200, 60), Thickness = 1.5 }, row)
+	end
+
+	-- ส่วนหัว: ชื่อไข่ (กดเพื่อขยาย) + ปุ่มวาร์ป
+	local header = make("Frame", {
+		Size = UDim2.new(1, 0, 0, 44),
+		BackgroundTransparency = 1,
+		LayoutOrder = 1,
+	}, row)
+
+	local warning = ""
+	if math.abs(info.Total - 100) > 0.01 then
+		warning = string.format(" | ⚠รวม %.1f%%", info.Total)
+	end
+
+	local toggle = make("TextButton", {
+		Size = UDim2.new(1, -74, 1, 0),
+		BackgroundTransparency = 1,
+		Text = string.format(
+			"  #%d %s\n  ราคา %s | EV %.1f | หายาก %.1f%%%s",
+			rank, info.Name, fmt(info.Price), info.EV, info.RareChance, warning
+		),
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, header)
+
+	local tpBtn = make("TextButton", {
+		Size = UDim2.fromOffset(64, 30),
+		Position = UDim2.new(1, -70, 0, 7),
+		BackgroundColor3 = Color3.fromRGB(60, 110, 200),
+		Text = "วาร์ป",
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+	}, header)
+	make("UICorner", { CornerRadius = UDim.new(0, 6) }, tpBtn)
+
+	-- ส่วนขยาย: รายการของในไข่
+	local body = make("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Visible = false,
+		LayoutOrder = 2,
+	}, row)
+	make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, body)
+	make("UIPadding", { PaddingBottom = UDim.new(0, 8) }, body)
+
+	for i, pet in ipairs(info.Pets) do
+		make("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 18),
+			BackgroundTransparency = 1,
+			Text = string.format("    %s — %.2f%% (มูลค่า %s)", pet.Name, pet.Chance, fmt(pet.Value)),
+			TextColor3 = rarityColor(pet.Chance),
+			Font = Enum.Font.Gotham,
+			TextSize = 13,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			LayoutOrder = i,
+		}, body)
+	end
+
+	toggle.Activated:Connect(function()
+		body.Visible = not body.Visible
+	end)
+	tpBtn.Activated:Connect(function()
+		teleportToEgg(info.Name)
+	end)
+end
+
+------------------------------------------------------------------
+-- รีเฟรช + เชื่อมปุ่ม
+------------------------------------------------------------------
+local ranking = {}
+
+local function refresh()
+	for _, child in ipairs(scroll:GetChildren()) do
+		if child:IsA("Frame") then
+			child:Destroy()
+		end
+	end
+	ranking = buildRanking()
+	for rank, info in ipairs(ranking) do
+		buildRow(rank, info)
+	end
+end
+
+local function toggleMenu()
+	main.Visible = not main.Visible
+end
+
+bestBtn.Activated:Connect(function()
+	local best = ranking[1]
+	if best then
+		teleportToEgg(best.Name)
+	end
+end)
+
+refreshBtn.Activated:Connect(refresh)
+menuBtn.Activated:Connect(toggleMenu)
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if not processed and input.KeyCode == CONFIG.ToggleKey then
+		toggleMenu()
+	end
+end)
+
+refresh()
